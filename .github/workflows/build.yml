@@ -35,18 +35,25 @@ jobs:
           Copy-Item $exe.FullName -Destination ffmpeg.exe
           Write-Host "ffmpeg.exe ready:" (Get-Item ffmpeg.exe).Length "bytes"
 
-      - name: Build single-file EXE (ffmpeg.exe bundled)
-        run: pyinstaller --onefile --name CounterDuration --add-binary "ffmpeg.exe;." CounterDuration.py
+      - name: Build single-folder EXE (ffmpeg.exe bundled)
+        run: pyinstaller --onefile --name CounterDuration-single --add-binary "ffmpeg.exe;." CounterDuration.py
 
-      - name: Upload build artifact
+      - name: Build multi-folder EXE (ffmpeg.exe bundled)
+        run: pyinstaller --onefile --name CounterDuration-multi --add-binary "ffmpeg.exe;." CounterDuration.py
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: CounterDuration-exe
-          path: dist/CounterDuration.exe
+          path: |
+            dist/CounterDuration-single.exe
+            dist/CounterDuration-multi.exe
 
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/CounterDuration.exe
+          files: |
+            dist/CounterDuration-single.exe
+            dist/CounterDuration-multi.exe
           generate_release_notes: true
