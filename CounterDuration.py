@@ -232,7 +232,7 @@ def _run_ffmpeg_capture(cmd, timeout, short_name):
         progress = TIME_RE.findall(tail)
         if progress:
             with print_lock:
-                print(f"\r-> [深度分析] {short_name} ... 已扫 {progress[-1]}", end="", flush=True)
+                print(f"\r-> 正在精确核对 {short_name} ... 已读到 {progress[-1]}", end="", flush=True)
         time.sleep(0.5)
 
     t.join(timeout=1)
@@ -307,7 +307,7 @@ def scan_folder(folder_path):
     ffmpeg_path = get_ffmpeg_path()
 
     print(f"目标目录: {folder_path}")
-    print("正在初始化文件索引...", end="", flush=True)
+    print("正在统计视频文件...", end="", flush=True)
 
     tasks = []
     for root, dirs, files in os.walk(folder_path):
@@ -323,14 +323,18 @@ def scan_folder(folder_path):
 
     # 自适应: 盘类型 + 中间段测速 -> 决定元数据阶段并发数
     drive_type = get_drive_type(folder_path)
-    print("正在探测磁盘性能...", end="", flush=True)
+    print("正在检测读取速度...", end="", flush=True)
     mbps = probe_disk_speed(tasks)
     workers = decide_workers(drive_type, mbps)
+    drive_label = {
+        "removable": "U盘/移动盘", "fixed": "本地硬盘", "remote": "网络盘",
+        "cdrom": "光驱", "ramdisk": "内存盘", "noroot": "未知设备", "unknown": "未知设备",
+    }.get(drive_type, "未知设备")
     speed_str = f"{mbps:.0f} MB/s" if mbps else "未知"
-    print(f" 完成 (盘类型: {drive_type}, 速度: {speed_str})")
+    print(f" 完成 (设备类型: {drive_label}, 读取速度: {speed_str})")
 
     print("-" * 80)
-    print(f"运行模式: 元数据并发 x{workers} | 深度扫描串行 (数据完整性优先)")
+    print("扫描方式: 快速读取 + 逐个精确核对 (确保时长准确)")
     print("-" * 80)
     print(f"{'文件名':<35} | {'处理方式':<10} | {'时长':<10} | {'状态'}")
     print("-" * 80)
@@ -352,14 +356,14 @@ def scan_folder(folder_path):
                 valid_count += 1
                 time_str = str(datetime.timedelta(seconds=int(duration)))
                 with print_lock:
-                    print(f"\u221a {filename:<35} | {'索引读取':<10} | {time_str:<10} | 成功")
+                    print(f"\u221a {filename:<35} | {'快速读取':<10} | {time_str:<10} | 成功")
             else:
                 suspects.append(file_path)
 
     # 阶段二: 深度扫描 (串行, 任何盘都不并发, 避免抖动)
     if suspects:
         print("-" * 80)
-        print(f"发现 {len(suspects)} 个可疑文件, 进入串行深度扫描...")
+        print(f"有 {len(suspects)} 个文件需要进一步核对, 正在逐个精确核对...")
         print("-" * 80)
         for file_path in suspects:
             filename = os.path.basename(file_path)
@@ -370,7 +374,7 @@ def scan_folder(folder_path):
                 valid_count += 1
                 time_str = str(datetime.timedelta(seconds=int(duration)))
                 with print_lock:
-                    print(f"\u2605 {filename:<35} | {'全量校验':<10} | {time_str:<10} | 成功")
+                    print(f"\u2605 {filename:<35} | {'精确核对':<10} | {time_str:<10} | 成功")
             else:
                 results_failed.append((filename, method))
                 with print_lock:
@@ -450,7 +454,7 @@ def main():
         sys.exit()
 
     multi = is_multi_mode()
-    print(f"运行模式: {'多目录 (多 U盘汇总)' if multi else '单目录'}")
+    print(f"扫描范围: {'多个文件夹 (汇总统计)' if multi else '单个文件夹'}")
 
     folders = select_folders(multi)
     if not folders:
