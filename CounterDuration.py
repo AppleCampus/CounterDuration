@@ -4,7 +4,7 @@ import subprocess
 import re
 import datetime
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import concurrent.futures
 import time
 import threading
@@ -194,17 +194,15 @@ def analyze_metadata(file_info):
     return file_path, header_seconds, "索引读取"
 
 
-# --- 阶段二: 全量深度扫描 (串行, 带实时进度 + 动态超时) ---
-def deep_scan(file_path, ffmpeg_path, timeout):
-    filename = os.path.basename(file_path)
-    cmd_deep = [ffmpeg_path, "-i", file_path, "-c", "copy", "-f", "null", "-"]
+# --- 阶段二辅助: 跑一次 ffmpeg 并实时刷进度, 返回 (stderr文本, 是否超时) ---
+def _run_ffmpeg_capture(cmd, timeout, short_name):
     try:
         proc = subprocess.Popen(
-            cmd_deep, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             bufsize=0, creationflags=_SUBPROCESS_FLAGS,
         )
     except Exception:
-        return 0.0, "未知错误"
+        return "", False
 
     collected = bytearray()
 
@@ -221,7 +219,6 @@ def deep_scan(file_path, ffmpeg_path, timeout):
     t = threading.Thread(target=reader, daemon=True)
     t.start()
 
-    short_name = filename if len(filename) <= 30 else filename[:27] + "..."
     start = time.time()
     timed_out = False
     while True:
@@ -235,23 +232,74 @@ def deep_scan(file_path, ffmpeg_path, timeout):
         progress = TIME_RE.findall(tail)
         if progress:
             with print_lock:
-                print(f"\r-> [深度分析] {short_name} ... 已扫 {progress[-1]}", end="", flush=True)
+                print(f"\r-> 正在精确核对 {short_name} ... 已读到 {progress[-1]}", end="", flush=True)
         time.sleep(0.5)
 
     t.join(timeout=1)
+    return bytes(collected).decode('utf-8', 'ignore'), timed_out
+
+
+def _clear_progress_line():
     with print_lock:
-        print("\r" + " " * 78 + "\r", end="", flush=True)  # 清掉进度行
+        print("\r" + " " * 78 + "\r", end="", flush=True)
 
-    if timed_out:
-        return 0.0, "读取超时"
 
-    output = bytes(collected).decode('utf-8', 'ignore')
+def _extract_duration(output):
     matches = TIME_RE.findall(output)
     if matches:
         final_seconds = parse_ffmpeg_time(matches[-1])
         if final_seconds > 1:
-            return final_seconds, "全量校验"
-    return 0.0, "解析失败"
+            return final_seconds
+    return 0.0
+
+
+def _failure_reason(output):
+    """把 ffmpeg 报错翻译成人话, 让用户知道是坏档而不是工具 bug。"""
+    low = output.lower()
+    if "moov atom not found" in low:
+        return "文件损坏:moov缺失(录制中断)"
+    if "invalid data found" in low:
+        return "文件损坏:数据非法"
+    if "could not find codec parameters" in low:
+        return "无法识别编码"
+    if "error while decoding" in low:
+        return "解码出错:帧损坏"
+    return "解析失败"
+
+
+# --- 阶段二: 全量深度扫描 (串行, 带实时进度 + 动态超时) ---
+def deep_scan(file_path, ffmpeg_path, timeout):
+    filename = os.path.basename(file_path)
+    short_name = filename if len(filename) <= 30 else filename[:27] + "..."
+
+    # 第一遍: 流复制 (快, 不解码), 多数可疑文件够用
+    out1, to1 = _run_ffmpeg_capture(
+        [ffmpeg_path, "-i", file_path, "-c", "copy", "-f", "null", "-"],
+        timeout, short_name,
+    )
+    if to1:
+        _clear_progress_line()
+        return 0.0, "读取超时"
+    dur = _extract_duration(out1)
+    if dur > 0:
+        _clear_progress_line()
+        return dur, "全量校验"
+
+    # 第二遍: 容错全解码 (慢, 但能救回索引损坏 / 时间戳缺失但帧数据尚存的文件)
+    out2, to2 = _run_ffmpeg_capture(
+        [ffmpeg_path, "-err_detect", "ignore_err", "-fflags", "+discardcorrupt",
+         "-i", file_path, "-f", "null", "-"],
+        timeout, short_name,
+    )
+    _clear_progress_line()
+    if to2:
+        return 0.0, "读取超时"
+    dur = _extract_duration(out2)
+    if dur > 0:
+        return dur, "深度解码"
+
+    # 两遍都拿不到时长 -> 文件真的残缺, 给出具体原因
+    return 0.0, _failure_reason(out1 + "\n" + out2)
 
 
 # --- 主流程 ---
@@ -259,7 +307,7 @@ def scan_folder(folder_path):
     ffmpeg_path = get_ffmpeg_path()
 
     print(f"目标目录: {folder_path}")
-    print("正在初始化文件索引...", end="", flush=True)
+    print("正在统计视频文件...", end="", flush=True)
 
     tasks = []
     for root, dirs, files in os.walk(folder_path):
@@ -275,14 +323,18 @@ def scan_folder(folder_path):
 
     # 自适应: 盘类型 + 中间段测速 -> 决定元数据阶段并发数
     drive_type = get_drive_type(folder_path)
-    print("正在探测磁盘性能...", end="", flush=True)
+    print("正在检测读取速度...", end="", flush=True)
     mbps = probe_disk_speed(tasks)
     workers = decide_workers(drive_type, mbps)
+    drive_label = {
+        "removable": "U盘/移动盘", "fixed": "本地硬盘", "remote": "网络盘",
+        "cdrom": "光驱", "ramdisk": "内存盘", "noroot": "未知设备", "unknown": "未知设备",
+    }.get(drive_type, "未知设备")
     speed_str = f"{mbps:.0f} MB/s" if mbps else "未知"
-    print(f" 完成 (盘类型: {drive_type}, 速度: {speed_str})")
+    print(f" 完成 (设备类型: {drive_label}, 读取速度: {speed_str})")
 
     print("-" * 80)
-    print(f"运行模式: 元数据并发 x{workers} | 深度扫描串行 (数据完整性优先)")
+    print("扫描方式: 快速读取 + 逐个精确核对 (确保时长准确)")
     print("-" * 80)
     print(f"{'文件名':<35} | {'处理方式':<10} | {'时长':<10} | {'状态'}")
     print("-" * 80)
@@ -304,14 +356,14 @@ def scan_folder(folder_path):
                 valid_count += 1
                 time_str = str(datetime.timedelta(seconds=int(duration)))
                 with print_lock:
-                    print(f"\u221a {filename:<35} | {'索引读取':<10} | {time_str:<10} | 成功")
+                    print(f"\u221a {filename:<35} | {'快速读取':<10} | {time_str:<10} | 成功")
             else:
                 suspects.append(file_path)
 
     # 阶段二: 深度扫描 (串行, 任何盘都不并发, 避免抖动)
     if suspects:
         print("-" * 80)
-        print(f"发现 {len(suspects)} 个可疑文件, 进入串行深度扫描...")
+        print(f"有 {len(suspects)} 个文件需要进一步核对, 正在逐个精确核对...")
         print("-" * 80)
         for file_path in suspects:
             filename = os.path.basename(file_path)
@@ -322,7 +374,7 @@ def scan_folder(folder_path):
                 valid_count += 1
                 time_str = str(datetime.timedelta(seconds=int(duration)))
                 with print_lock:
-                    print(f"\u2605 {filename:<35} | {'全量校验':<10} | {time_str:<10} | 成功")
+                    print(f"\u2605 {filename:<35} | {'精确核对':<10} | {time_str:<10} | 成功")
             else:
                 results_failed.append((filename, method))
                 with print_lock:
@@ -332,35 +384,119 @@ def scan_folder(folder_path):
     return total_seconds, valid_count, total_files, elapsed
 
 
-if __name__ == "__main__":
+# --- 报告输出 ---
+def print_report(seconds, valid, total, cost_time, title="视频统计分析报告"):
+    final_time = str(datetime.timedelta(seconds=int(seconds)))
+    class_hours = seconds / 2700.0  # 45 分钟 / 课时
+
+    print("\n" + "=" * 80)
+    print(title)
+    print("-" * 80)
+    print(f"执行耗时 : {cost_time:.1f} 秒")
+    print(f"处理进度 : {valid} / {total} 文件")
+    print("-" * 80)
+    print(f"累计时长 : {final_time}")
+    print(f"折算课时 : {class_hours:.1f} 课时 (标准: 45分钟/课时)")
+    print("=" * 80)
+
+
+# --- 运行模式判定 (single / multi) ---
+def is_multi_mode():
+    """决定单目录还是多目录(多U盘)模式。
+    优先级: 环境变量 SCAN_MODE > 可执行文件名是否含 'multi'。
+    这样同一份源码可被 PyInstaller 打成 single / multi 两个 exe。"""
+    env = os.environ.get("SCAN_MODE")
+    if env:
+        return env.strip().lower() == "multi"
+    if getattr(sys, "frozen", False):
+        name = os.path.basename(sys.executable).lower()
+    else:
+        name = os.path.basename(sys.argv[0]).lower()
+    return "multi" in name
+
+
+# --- 文件夹选择 (单目录 / 多目录) ---
+def select_folders(multi=False):
+    root = tk.Tk()
+    root.withdraw()
+    folders = []
+
+    if not multi:
+        f = filedialog.askdirectory(title="选择视频文件夹")
+        if f:
+            folders.append(os.path.abspath(f))
+        root.destroy()
+        return folders
+
+    # 多目录模式: 逐个选择, 直到用户选择不再继续
+    while True:
+        f = filedialog.askdirectory(title=f"选择第 {len(folders) + 1} 个文件夹 / U盘")
+        if f:
+            f = os.path.abspath(f)
+            if f not in folders:
+                folders.append(f)
+            else:
+                messagebox.showinfo("提示", "该目录已添加, 已自动跳过重复项。")
+        more = messagebox.askyesno(
+            "继续添加",
+            f"当前已选 {len(folders)} 个目录。\n是否继续添加下一个 (例如另一个 U盘)?",
+        )
+        if not more:
+            break
+    root.destroy()
+    return folders
+
+
+def main():
     if not os.path.exists(get_ffmpeg_path()):
         print("【错误】核心组件 ffmpeg 缺失。")
         input("按回车键退出...")
         sys.exit()
 
-    root = tk.Tk()
-    root.withdraw()
-    target_folder = filedialog.askdirectory(title="选择视频文件夹")
+    multi = is_multi_mode()
+    print(f"扫描范围: {'多个文件夹 (汇总统计)' if multi else '单个文件夹'}")
 
-    if target_folder:
-        target_folder = os.path.abspath(target_folder)
+    folders = select_folders(multi)
+    if not folders:
+        input("\n未选择任何文件夹, 按回车键退出...")
+        return
+
+    grand_seconds = 0.0
+    grand_valid = 0
+    grand_total = 0
+    grand_cost = 0.0
+
+    for folder in folders:
+        if multi:
+            print("\n" + "#" * 80)
+            print(f"开始扫描目录: {folder}")
+            print("#" * 80)
         try:
-            seconds, valid, total, cost_time = scan_folder(target_folder)
+            seconds, valid, total, cost_time = scan_folder(folder)
         except KeyboardInterrupt:
-            print("\n已手动中断。")
+            print("\n已手动中断当前目录。")
             seconds, valid, total, cost_time = 0.0, 0, 0, 0.0
 
-        final_time = str(datetime.timedelta(seconds=int(seconds)))
-        class_hours = seconds / 2700.0  # 45 分钟 / 课时
+        grand_seconds += seconds
+        grand_valid += valid
+        grand_total += total
+        grand_cost += cost_time
 
-        print("\n" + "=" * 80)
-        print(f"视频统计分析报告")
-        print("-" * 80)
-        print(f"执行耗时 : {cost_time:.1f} 秒")
-        print(f"处理进度 : {valid} / {total} 文件")
-        print("-" * 80)
-        print(f"累计时长 : {final_time}")
-        print(f"折算课时 : {class_hours:.1f} 课时 (标准: 45分钟/课时)")
-        print("=" * 80)
+        # 多目录模式下先输出每个目录的小结
+        if multi:
+            print_report(seconds, valid, total, cost_time, title=f"目录统计: {folder}")
+
+    # 汇总报告: 单目录直接出报告; 多目录(>1)再出一份总表
+    if not multi:
+        print_report(grand_seconds, grand_valid, grand_total, grand_cost)
+    elif len(folders) > 1:
+        print_report(
+            grand_seconds, grand_valid, grand_total, grand_cost,
+            title=f"全部 {len(folders)} 个目录汇总",
+        )
 
     input("\n按回车键退出...")
+
+
+if __name__ == "__main__":
+    main()
