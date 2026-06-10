@@ -3,10 +3,16 @@ name: Build Windows EXE
 on:
   push:
     branches:
-      - main
+      - '**'        # 任意分支推送都构建
     tags:
       - 'v*'
+  pull_request:      # PR 阶段也构建测试 exe
   workflow_dispatch:
+
+# 同一分支/PR 有新提交时, 取消正在跑的旧构建, 省时间
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -43,17 +49,17 @@ jobs:
       - name: Build multi-folder EXE (ffmpeg.exe bundled)
         run: pyinstaller --onefile --name CounterDuration-multi --add-binary "ffmpeg.exe;." CounterDuration.py
 
-      - name: Upload build artifacts
+      - name: Upload build artifacts (每个分支 / PR 都可下载的测试 exe)
         uses: actions/upload-artifact@v4
         with:
-          name: CounterDuration-exe
+          name: CounterDuration-exe-${{ github.sha }}
           path: |
             dist/CounterDuration-single.exe
             dist/CounterDuration-multi.exe
 
       # --- 每次推到 main: 刷新固定的 "latest" 滚动发布 (下载链接永不变) ---
       - name: Remove previous "latest" release
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,7 +69,7 @@ jobs:
           exit 0
 
       - name: Publish rolling "latest" release
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
